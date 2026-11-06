@@ -3,15 +3,14 @@ import AppKit
 let app = NSApplication.shared
 let args = CommandLine.arguments
 
-// `ccburn --snapshot out.png [--dark] [--columns N]` renders one panel to PNG and exits.
+// `ccburn --snapshot out.png [--dark]` renders one panel to PNG and exits.
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
-    let columns = args.firstIndex(of: "--columns").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil }
-        ?? AppDelegate.columns
     let appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)!
     do {
-        let frame = try Engine().runSync(columns: columns, height: AppDelegate.chartHeight).get()
+        let frame = try Engine().runSync(height: AppDelegate.chartHeight).get()
         let view = TerminalView()
-        view.columns = columns
+        view.columns = frame.width
+        view.chart = frame.chart
         view.rows = ANSIParser.parse(frame.frame)
         guard let png = view.pngData(appearance: appearance, padding: AppDelegate.padding) else {
             fputs("snapshot: render failed\n", stderr)

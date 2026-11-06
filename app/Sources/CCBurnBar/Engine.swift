@@ -1,14 +1,44 @@
 import Foundation
 
-/// One `ccburn --json` frame: the colored screen plus the headline numbers.
+/// One `ccburn --json` frame: the colored screen, the chart's data and the headline numbers.
 struct Frame: Decodable {
     let frame: String
+    /// Columns the screen is laid out on.
+    let width: Int
+    /// nil when there was no usage in the last hour.
+    let chart: ChartData?
     let rate_5m: Double
     let rate_15m: Double
     let rate_60m: Double
     let today: Double
     let projected_today: Double
     let updated: String
+}
+
+/// The per-minute chart, drawn by the app into blank rows the frame leaves for it.
+struct ChartData: Decodable {
+    struct Axis: Decodable {
+        /// Row counted from the bottom of the plot.
+        let row: Int
+        let text: String
+    }
+
+    struct Series: Decodable {
+        let provider: String
+        /// xterm 256-color index, as in the terminal.
+        let color: Int
+        let values: [Double]
+    }
+
+    /// Frame row where the plot starts; it spans `height` rows, then the baseline row and the time-label row.
+    let row: Int
+    let height: Int
+    /// Columns reserved for the y-axis labels, plus one gap column.
+    let axis_width: Int
+    let axis: [Axis]
+    let labels: [String]
+    /// Bottom of the stack first.
+    let series: [Series]
 }
 
 enum EngineError: LocalizedError {
@@ -41,10 +71,10 @@ final class Engine {
     }
 
     /// Calls `completion` on a background queue.
-    func run(columns: Int, height: Int, completion: @escaping (Result<Frame, Error>) -> Void) {
+    func run(height: Int, completion: @escaping (Result<Frame, Error>) -> Void) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", scriptURL.path, "--json", "--width", String(columns), "--height", String(height)]
+        process.arguments = ["python3", scriptURL.path, "--json", "--height", String(height)]
         var env = ProcessInfo.processInfo.environment
         // A GUI launch gets launchd's bare PATH; prefer a Homebrew python3, fall back to the system one.
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
@@ -97,10 +127,10 @@ final class Engine {
     }
 
     /// Blocking variant for the `--snapshot` mode.
-    func runSync(columns: Int, height: Int) -> Result<Frame, Error> {
+    func runSync(height: Int) -> Result<Frame, Error> {
         let done = DispatchSemaphore(value: 0)
         var result: Result<Frame, Error> = .failure(EngineError.failed("no result"))
-        run(columns: columns, height: height) {
+        run(height: height) {
             result = $0
             done.signal()
         }

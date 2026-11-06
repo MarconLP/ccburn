@@ -27,7 +27,7 @@ Costs are API-equivalent estimates. They are not what a Claude or ChatGPT subscr
 | `--height ROWS` | chart height (default 12) |
 | `--width COLUMNS` | screen width (default: the terminal's) |
 | `--offline` | never fetch the LiteLLM rate table |
-| `--json` | one frame as JSON: the colored screen plus the headline numbers (used by the app) |
+| `--json` | one frame for the menu bar app: the colored screen at table width, the chart's data, the headline numbers |
 
 Needs only `python3` (3.9 or newer), no packages. `make cli` links `~/.local/bin/ccburn` to this checkout.
 
@@ -35,6 +35,8 @@ Needs only `python3` (3.9 or newer), no packages. `make cli` links `~/.local/bin
 
 `app/` is a small AppKit app that shows the same screen in a menu bar popover. It runs the bundled
 `ccburn --json` every 60 seconds and draws the frame on a character grid, the way a terminal does.
+It draws the per-minute chart itself, with bars thinner than a character, so the chart fits the
+tables' width instead of needing a column per minute.
 
 ```sh
 make install        # build, copy to /Applications, start

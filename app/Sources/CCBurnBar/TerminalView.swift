@@ -130,8 +130,11 @@ final class TerminalView: NSView {
         }
     }
     /// Minimum width in columns, so the panel keeps its size while a frame loads.
-    var columns: Int = 80 {
+    var columns: Int = 54 {
         didSet { invalidateIntrinsicContentSize() }
+    }
+    var chart: ChartData? {
+        didSet { needsDisplay = true }
     }
     private let font: NSFont
     private let boldFont: NSFont
@@ -158,6 +161,7 @@ final class TerminalView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             drawCells(in: dirtyRect)
+            if let chart { drawChart(chart) }
         }
     }
 
@@ -188,6 +192,57 @@ final class TerminalView: NSView {
                 }
             }
         }
+    }
+
+    /// The per-minute chart: same layout, colors and labels as the terminal one, but each
+    /// minute gets a 60th of the plot width instead of a whole character column.
+    private func drawChart(_ chart: ChartData) {
+        let cw = cellSize.width
+        let chh = cellSize.height
+        let n = chart.labels.count
+        guard n > 0 else { return }
+        let top = CGFloat(chart.row) * chh
+        let plotH = CGFloat(chart.height) * chh
+        let plotX = CGFloat(chart.axis_width + 1) * cw
+        let plotW = intrinsicContentSize.width - plotX
+        let barW = plotW / CGFloat(n)
+        let dim = NSColor.secondaryLabelColor
+
+        for a in chart.axis {
+            drawText(a.text, at: NSPoint(x: 0, y: top + CGFloat(chart.height - 1 - a.row) * chh), color: dim)
+        }
+
+        let value = { (s: ChartData.Series, i: Int) -> Double in s.values.indices.contains(i) ? s.values[i] : 0 }
+        let peak = (0..<n).map { i in chart.series.reduce(0) { $0 + value($1, i) } }.max() ?? 0
+        if peak > 0 {
+            for i in 0..<n {
+                var base = top + plotH
+                for s in chart.series {
+                    let v = value(s, i)
+                    guard v > 0 else { continue }
+                    let h = plotH * CGFloat(v / peak)
+                    (XTerm.color(.indexed(s.color)) ?? .labelColor).setFill()
+                    let x0 = plotX + CGFloat(i) * barW
+                    backingAlignedRect(NSRect(x: x0, y: base - h, width: barW, height: h), options: .alignAllEdgesNearest).fill()
+                    base -= h
+                }
+            }
+        }
+
+        dim.setFill()
+        backingAlignedRect(NSRect(x: plotX, y: (top + plotH + chh / 2).rounded(.down), width: plotW, height: 1), options: .alignAllEdgesNearest).fill()
+
+        let labelY = top + plotH + chh
+        drawText(chart.labels[0], at: NSPoint(x: plotX, y: labelY), color: dim)
+        if n > 2 {
+            drawText(chart.labels[n / 2], at: NSPoint(x: plotX + CGFloat(n / 2) * barW, y: labelY), color: dim)
+        }
+        let last = chart.labels[n - 1]
+        drawText(last, at: NSPoint(x: plotX + plotW - CGFloat(last.count) * cw, y: labelY), color: dim)
+    }
+
+    private func drawText(_ text: String, at point: NSPoint, color: NSColor) {
+        NSAttributedString(string: text, attributes: [.font: font, .foregroundColor: color]).draw(at: point)
     }
 
     private func foreground(_ style: CellStyle) -> NSColor {

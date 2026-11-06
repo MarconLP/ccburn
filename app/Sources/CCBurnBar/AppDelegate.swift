@@ -47,9 +47,6 @@ final class SolidBackgroundView: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let chartHeight = 12
-    /// Width handed to `ccburn --width`: one column per minute of chart plus its axis,
-    /// with the tables stretched to the same right edge.
-    static let columns = 68
     static let refreshInterval: TimeInterval = 60
     static let padding: CGFloat = 16
 
@@ -94,7 +91,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         popover.animates = false
 
-        terminal.columns = Self.columns
         terminal.menu = makeMenu()
         show(message: "\u{1B}[2mloading…\u{1B}[0m")
 
@@ -124,7 +120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let engine, !running else { return }
         running = true
         lastRun = Date()
-        engine.run(columns: Self.columns, height: Self.chartHeight) { [weak self] result in
+        engine.run(height: Self.chartHeight) { [weak self] result in
             DispatchQueue.main.async { self?.apply(result) }
         }
     }
@@ -134,6 +130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch result {
         case .success(let frame):
             lastFrame = frame
+            terminal.columns = frame.width
+            terminal.chart = frame.chart
             terminal.rows = ANSIParser.parse(frame.frame)
             updateTitle()
             // "2026-11-06T20:46:01+01:00" -> "20:46:01"
@@ -146,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func show(message: String) {
+        terminal.chart = nil
         terminal.rows = ANSIParser.parse(message)
         resizePanel()
     }
