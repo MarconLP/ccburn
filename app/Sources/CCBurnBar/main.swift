@@ -6,7 +6,7 @@ let args = CommandLine.arguments
 // `ccburn --snapshot out.png [--dark] [--columns N]` renders one panel to PNG and exits.
 if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
     let columns = args.firstIndex(of: "--columns").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil }
-        ?? PanelWidth.compact.rawValue
+        ?? AppDelegate.columns
     let appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)!
     do {
         let frame = try Engine().runSync(columns: columns, height: AppDelegate.chartHeight).get()

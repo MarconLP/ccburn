@@ -36,21 +36,6 @@ enum TitleMetric: String, CaseIterable {
     }
 }
 
-/// Columns handed to `ccburn --width`. Only the chart follows the width; the
-/// tables are fixed, and compact (one column per minute) keeps the chart as
-/// wide as the text above it.
-enum PanelWidth: Int, CaseIterable {
-    case compact = 70
-    case wide = 130
-
-    var label: String {
-        switch self {
-        case .compact: return "Compact (70 columns)"
-        case .wide: return "Wide (130 columns)"
-        }
-    }
-}
-
 /// Opaque panel background. macOS 26 popovers are glass, and text over
 /// whatever window sits behind them is hard to read.
 final class SolidBackgroundView: NSView {
@@ -62,6 +47,9 @@ final class SolidBackgroundView: NSView {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let chartHeight = 12
+    /// Width handed to `ccburn --width`: one column per minute of chart plus its axis,
+    /// with the tables stretched to the same right edge.
+    static let columns = 68
     static let refreshInterval: TimeInterval = 60
     static let padding: CGFloat = 16
 
@@ -80,11 +68,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var titleMetric: TitleMetric {
         get { TitleMetric(rawValue: defaults.string(forKey: "titleMetric") ?? "") ?? .rate60 }
         set { defaults.set(newValue.rawValue, forKey: "titleMetric") }
-    }
-
-    private var panelWidth: PanelWidth {
-        get { PanelWidth(rawValue: defaults.integer(forKey: "panelColumns")) ?? .compact }
-        set { defaults.set(newValue.rawValue, forKey: "panelColumns") }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -111,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         popover.animates = false
 
-        terminal.columns = panelWidth.rawValue
+        terminal.columns = Self.columns
         terminal.menu = makeMenu()
         show(message: "\u{1B}[2mloading…\u{1B}[0m")
 
@@ -141,7 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let engine, !running else { return }
         running = true
         lastRun = Date()
-        engine.run(columns: panelWidth.rawValue, height: Self.chartHeight) { [weak self] result in
+        engine.run(columns: Self.columns, height: Self.chartHeight) { [weak self] result in
             DispatchQueue.main.async { self?.apply(result) }
         }
     }
@@ -234,17 +217,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleItem.submenu = titleMenu
         menu.addItem(titleItem)
 
-        let widthMenu = NSMenu()
-        for width in PanelWidth.allCases {
-            let it = item(width.label, #selector(pickPanelWidth(_:)))
-            it.tag = width.rawValue
-            it.state = width == panelWidth ? .on : .off
-            widthMenu.addItem(it)
-        }
-        let widthItem = NSMenuItem(title: "Panel Width", action: nil, keyEquivalent: "")
-        widthItem.submenu = widthMenu
-        menu.addItem(widthItem)
-
         let login = item("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -265,15 +237,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleMetric = metric
         updateTitle()
         terminal.menu = makeMenu()
-    }
-
-    @objc private func pickPanelWidth(_ sender: NSMenuItem) {
-        guard let width = PanelWidth(rawValue: sender.tag) else { return }
-        panelWidth = width
-        terminal.columns = width.rawValue
-        terminal.menu = makeMenu()
-        resizePanel()
-        refresh()
     }
 
     @objc private func toggleLaunchAtLogin() {
