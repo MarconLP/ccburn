@@ -1,19 +1,17 @@
 import AppKit
 import ServiceManagement
 
-/// What the menu bar item shows next to its icon.
+/// What the menu bar item shows. It is text only, no icon.
 enum TitleMetric: String, CaseIterable {
     case rate60 = "rate60"
     case rate5 = "rate5"
     case today = "today"
-    case iconOnly = "icon"
 
     var label: String {
         switch self {
         case .rate60: return "Last 60 min rate"
         case .rate5: return "Last 5 min rate"
         case .today: return "Today so far"
-        case .iconOnly: return "Icon only"
         }
     }
 
@@ -22,7 +20,6 @@ enum TitleMetric: String, CaseIterable {
         case .rate60: return Self.usd(f.rate_60m) + "/h"
         case .rate5: return Self.usd(f.rate_5m) + "/h"
         case .today: return Self.usd(f.today)
-        case .iconOnly: return ""
         }
     }
 
@@ -69,10 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let button = statusItem.button {
-            let icon = NSImage(systemSymbolName: "flame", accessibilityDescription: "ccburn")
-            icon?.isTemplate = true
-            button.image = icon
-            button.imagePosition = .imageLeading
+            button.title = "ccburn"
             button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             button.target = self
             button.action = #selector(statusItemClicked(_:))
@@ -151,14 +145,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func show(error: Error) {
         show(message: "\u{1B}[1mccburn failed\u{1B}[0m\n\n" + error.localizedDescription)
-        statusItem.button?.title = lastFrame == nil ? " !" : statusItem.button?.title ?? ""
+        statusItem.button?.title = lastFrame == nil ? "ccburn !" : statusItem.button?.title ?? ""
         statusItem.button?.toolTip = "ccburn: \(error.localizedDescription)"
     }
 
     private func updateTitle() {
         guard let button = statusItem.button else { return }
-        let text = lastFrame.map(titleMetric.text) ?? ""
-        button.title = text.isEmpty ? "" : " " + text
+        button.title = lastFrame.map(titleMetric.text) ?? "ccburn"
     }
 
     private func resizePanel() {

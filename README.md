@@ -42,8 +42,8 @@ tables' width instead of needing a column per minute.
 make install        # build, copy to /Applications, start
 ```
 
-- Click the flame to open the screen. Right-click for the menu: refresh, what the menu bar shows
-  (last 60 min rate, last 5 min rate, today so far, or only the icon), launch at login, quit.
+- Click the number in the menu bar to open the screen. Right-click for the menu: refresh, what it shows
+  (last 60 min rate, last 5 min rate or today so far), launch at login, quit.
 - Needs macOS 13 or newer, the Xcode Command Line Tools to build, and `python3` on the machine at run time.
 - The build is signed ad hoc for local use. There are no prebuilt releases.
 
