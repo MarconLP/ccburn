@@ -40,6 +40,7 @@ tables' width instead of needing a column per minute.
 
 ```sh
 make install        # build, copy to /Applications, start
+/Applications/ccburn.app/Contents/MacOS/ccburn --login-item on   # start at login (also in the menu); off | status
 ```
 
 - Click the number in the menu bar to open the screen. Right-click for the menu: refresh, what it shows
