@@ -36,15 +36,27 @@ enum TitleMetric: String, CaseIterable {
     }
 }
 
+/// Columns handed to `ccburn --width`. Only the chart follows the width; the
+/// tables are fixed, and compact (one column per minute) keeps the chart as
+/// wide as the text above it.
 enum PanelWidth: Int, CaseIterable {
-    case compact = 130
-    case wide = 190
+    case compact = 70
+    case wide = 130
 
     var label: String {
         switch self {
-        case .compact: return "Compact (130 columns)"
-        case .wide: return "Wide (190 columns)"
+        case .compact: return "Compact (70 columns)"
+        case .wide: return "Wide (130 columns)"
         }
+    }
+}
+
+/// Opaque panel background. macOS 26 popovers are glass, and text over
+/// whatever window sits behind them is hard to read.
+final class SolidBackgroundView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        dirtyRect.fill()
     }
 }
 
@@ -87,7 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        let container = NSView()
+        let container = SolidBackgroundView()
         terminal.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(terminal)
         NSLayoutConstraint.activate([
@@ -114,6 +126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
         refresh()
+
+        // Development aid: open the panel at launch so it can be screenshotted.
+        if CommandLine.arguments.contains("--show-panel") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.togglePopover() }
+        }
     }
 
     // MARK: Refresh
@@ -136,7 +153,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastFrame = frame
             terminal.rows = ANSIParser.parse(frame.frame)
             updateTitle()
-            statusItem.button?.toolTip = "ccburn · updated \(frame.updated)"
+            // "2026-11-06T20:46:01+01:00" -> "20:46:01"
+            let time = frame.updated.split(separator: "T").last.map { String($0.prefix(8)) } ?? frame.updated
+            statusItem.button?.toolTip = "ccburn · updated \(time)"
             resizePanel()
         case .failure(let error):
             show(error: error)
