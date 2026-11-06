@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""ccburn: live burn-rate dashboard for Claude Code and Codex spend.
+
+Reads the Claude Code and Codex CLIs' own on-disk transcripts (scan/price/
+de-dupe pipeline ported from t3code `apps/server/src/usage/`), prices them
+against LiteLLM's rate table, and redraws one screen: trailing 5/15/60 min
+rates with an end-of-day projection, today's total, per-provider and per-model
+tables, and a per-minute stacked chart of the last hour.
+
+Costs are API-equivalent estimates, not what a subscription bills.
+
+Extra Claude Code config dirs (one per profile) and Codex homes go in
+~/.config/ccburn/config.json, see config.example.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pickle
+import shutil
+import sys
+import time
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ccburn"
+CONFIG_PATH = Path(
+    os.environ.get("CCBURN_CONFIG")
+    or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ccburn" / "config.json"
+).expanduser()
+RATES_CACHE = CACHE_DIR / "litellm.json"
+SCAN_CACHE = CACHE_DIR / "scan-cache-v2.pickle"
+RATES_TTL_S = 24 * 3600
+MTIME_SLACK_MS = 36 * 3600 * 1000
+FORK_COPY_MAX_GAP_MS = 1000
+UNPRICEABLE = {"<synthetic>", "synthetic", "opus", "sonnet", "haiku", "fable"}
+
+# Record layout (tuple for a compact pickle cache):
+# provider, ts_ms, model, session, uncached, cached, cache_create, output, reasoning, reported_cost, dedupe_key, cache_create_1h
+# cache_create_1h is the part of cache_create written with a 1-hour TTL, which Anthropic bills at a higher rate.
+PROV, TS, MODEL, SESSION, UNCACHED, CACHED, CCREATE, OUTPUT, REASON, RCOST, DEDUPE, CC1H = range(12)
+
+
+# ---------------------------------------------------------------- transcripts
+
+
+def _int(v: object) -> int:
+    return int(v) if isinstance(v, (int, float)) and v > 0 and v == v else 0
+
+
+def _ts_ms(v: object) -> int | None:
+    if not isinstance(v, str):
+        return None
+    try:
+        s = v.replace("Z", "+00:00")
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def parse_claude_line(line: str) -> tuple | None:
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(rec, dict) or rec.get("type") != "assistant":
+        return None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        return None
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    ts = _ts_ms(rec.get("timestamp"))
+    model = msg.get("model")
+    if ts is None or not isinstance(model, str) or not model:
+        return None
+    mid = msg.get("id") if isinstance(msg.get("id"), str) else None
+    rid = rec.get("requestId") if isinstance(rec.get("requestId"), str) else None
+    dedupe = None if mid is None and rid is None else f"{mid or ''}:{rid or ''}"
+    cost = rec.get("costUSD")
+    cc = usage.get("cache_creation")
+    cc1h = _int(cc.get("ephemeral_1h_input_tokens")) if isinstance(cc, dict) else 0
+    return (
+        "claude",
+        ts,
+        model,
+        rec.get("sessionId") if isinstance(rec.get("sessionId"), str) else "",
+        _int(usage.get("input_tokens")),
+        _int(usage.get("cache_read_input_tokens")),
+        _int(usage.get("cache_creation_input_tokens")),
+        _int(usage.get("output_tokens")),
+        0,
+        cost if isinstance(cost, (int, float)) else None,
+        dedupe,
+        cc1h,
+    )
+
+
+class CodexState:
+    __slots__ = ("model", "session", "last_sig", "saw_meta", "suppressing", "anchor")
+
+    def __init__(self) -> None:
+        self.model = ""
+        self.session = ""
+        self.last_sig: str | None = None
+        self.saw_meta = False
+        self.suppressing = False
+        self.anchor = 0
+
+
+def _is_forked_meta(payload: dict) -> bool:
+    if isinstance(payload.get("forked_from_id"), str):
+        return True
+    spawn = (((payload.get("source") or {}) if isinstance(payload.get("source"), dict) else {}).get("subagent") or {})
+    spawn = spawn.get("thread_spawn") if isinstance(spawn, dict) else None
+    return isinstance(spawn, dict) and isinstance(spawn.get("parent_thread_id"), str)
+
+
+def parse_codex_line(line: str, st: CodexState) -> tuple | None:
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(rec, dict):
+        return None
+    payload = rec.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    kind = rec.get("type")
+    if kind == "session_meta":
+        if st.saw_meta:
+            return None
+        st.saw_meta = True
+        sid = payload.get("id") or payload.get("session_id")
+        if isinstance(sid, str):
+            st.session = sid
+        ts = _ts_ms(rec.get("timestamp"))
+        if ts is not None and _is_forked_meta(payload):
+            st.suppressing = True
+            st.anchor = ts
+        return None
+    if kind == "turn_context":
+        if isinstance(payload.get("model"), str):
+            st.model = payload["model"]
+        return None
+    if payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    last = info.get("last_token_usage") if isinstance(info, dict) else None
+    if not isinstance(last, dict):
+        return None
+    ts = _ts_ms(rec.get("timestamp"))
+    if ts is None or not st.model:
+        return None
+    sig = json.dumps(last, sort_keys=True)
+    if sig == st.last_sig:
+        return None
+    st.last_sig = sig
+    if st.suppressing:
+        if ts - st.anchor < FORK_COPY_MAX_GAP_MS:
+            st.anchor = ts
+            return None
+        st.suppressing = False
+    inp = _int(last.get("input_tokens"))
+    cached = _int(last.get("cached_input_tokens"))
+    ccreate = _int(last.get("cache_write_input_tokens"))
+    out = _int(last.get("output_tokens"))
+    uncached = max(0, inp - cached - ccreate)
+    if uncached + cached + ccreate + out == 0:
+        return None
+    return ("codex", ts, st.model, st.session, uncached, cached, ccreate, out, min(out, _int(last.get("reasoning_output_tokens"))), None, None, 0)
+
+
+def scan_file(path: Path, provider: str) -> list[tuple]:
+    out: list[tuple] = []
+    st = CodexState()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if provider == "claude":
+                    if '"usage"' not in line:
+                        continue
+                    rec = parse_claude_line(line)
+                else:
+                    if '"token_count"' not in line and '"turn_context"' not in line and '"session_meta"' not in line:
+                        continue
+                    rec = parse_codex_line(line, st)
+                if rec is not None:
+                    out.append(rec)
+    except OSError:
+        return []
+    return out
+
+
+def load_config() -> dict:
+    """The optional JSON config. A broken file is reported and ignored, never fatal."""
+    try:
+        doc = json.loads(CONFIG_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"ccburn: ignoring {CONFIG_PATH}: {e}", file=sys.stderr)
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _paths(v: object) -> list[Path]:
+    items = v if isinstance(v, list) else [v] if isinstance(v, str) else []
+    return [Path(p.strip()).expanduser() for p in items if isinstance(p, str) and p.strip()]
+
+
+def transcript_roots(config: dict) -> list[tuple[str, Path]]:
+    # Union rather than override: a shell inside one Claude install exports
+    # CLAUDE_CONFIG_DIR for that install alone, and scanning only it would
+    # silently drop every other install's usage. Extra installs (profiles)
+    # come from the config file, which also reaches GUI launches with no
+    # shell environment.
+    claude_homes = [Path.home() / ".config" / "claude", Path.home() / ".claude"]
+    claude_homes += _paths(config.get("claude_config_dirs"))
+    claude_homes += _paths(os.environ.get("CLAUDE_CONFIG_DIR", "").split(","))
+    codex_homes = [Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()]
+    codex_homes += _paths(config.get("codex_homes"))
+
+    roots: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+
+    def add(provider: str, cand: Path) -> None:
+        if cand.is_dir():
+            real = cand.resolve()
+            if real not in seen:
+                seen.add(real)
+                roots.append((provider, real))
+
+    for h in claude_homes:
+        add("claude", h / "projects")
+        add("claude", h / ".claude" / "projects")
+    for h in codex_homes:
+        add("codex", h / "sessions")
+    return roots
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    # The menu bar app and a terminal ccburn can share the cache; a reader must never see half a file.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def collect_records(since_ms: int, verbose: bool, config: dict) -> tuple[list[tuple], dict[str, int]]:
+    cache: dict = {}
+    if SCAN_CACHE.exists():
+        try:
+            cache = pickle.loads(SCAN_CACHE.read_bytes())
+        except Exception:
+            cache = {}
+    live: dict = {}
+    records: list[tuple] = []
+    stats = {"files": 0, "parsed": 0}
+    cutoff = (since_ms - MTIME_SLACK_MS) / 1000
+    for provider, root in transcript_roots(config):
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                p = Path(dirpath) / name
+                try:
+                    stt = p.stat()
+                except OSError:
+                    continue
+                if stt.st_mtime < cutoff:
+                    continue
+                key = str(p)
+                hit = cache.get(key)
+                if hit and hit[0] == stt.st_size and hit[1] == stt.st_mtime_ns:
+                    recs = hit[2]
+                else:
+                    recs = scan_file(p, provider)
+                    stats["parsed"] += 1
+                    if verbose and sys.stderr.isatty():
+                        print(f"\r  parsing {stats['parsed']} files...", end="", file=sys.stderr, flush=True)
+                live[key] = (stt.st_size, stt.st_mtime_ns, recs)
+                records.extend(recs)
+                stats["files"] += 1
+    if verbose and stats["parsed"] and sys.stderr.isatty():
+        print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+    try:
+        # Protocol 4 reads on every python3 the app may find (system 3.9 included).
+        _write_atomic(SCAN_CACHE, pickle.dumps(live, protocol=4))
+    except OSError:
+        pass
+    return records, stats
+
+
+# -------------------------------------------------------------------- pricing
+
+
+def load_rates(offline: bool) -> tuple[dict[str, tuple[float, float, float, float, float]], str]:
+    doc = None
+    status = "unavailable"
+    fresh = RATES_CACHE.exists() and time.time() - RATES_CACHE.stat().st_mtime < RATES_TTL_S
+    if not offline and not fresh:
+        try:
+            with urllib.request.urlopen(LITELLM_URL, timeout=10) as r:
+                raw = r.read()
+            doc = json.loads(raw)
+            _write_atomic(RATES_CACHE, raw)
+            status = "fresh"
+        except Exception:
+            doc = None
+    if doc is None and RATES_CACHE.exists():
+        try:
+            doc = json.loads(RATES_CACHE.read_text())
+            status = "cached"
+        except Exception:
+            doc = None
+    table: dict[str, tuple[float, float, float, float, float]] = {}
+    if not isinstance(doc, dict):
+        return table, status
+    for name, e in doc.items():
+        if not isinstance(e, dict):
+            continue
+        inp, out = e.get("input_cost_per_token"), e.get("output_cost_per_token")
+        if not isinstance(inp, (int, float)) or not isinstance(out, (int, float)):
+            continue
+        cr = e.get("cache_read_input_token_cost")
+        cw = e.get("cache_creation_input_token_cost")
+        cw1h = e.get("cache_creation_input_token_cost_above_1hr")
+        cw_rate = float(cw) if isinstance(cw, (int, float)) else float(inp)
+        table[name.strip().lower()] = (
+            float(inp),
+            float(out),
+            float(cr) if isinstance(cr, (int, float)) else float(inp),
+            cw_rate,
+            float(cw1h) if isinstance(cw1h, (int, float)) else cw_rate,
+        )
+    # Alias bare names when every provider-qualified entry agrees on the rate.
+    candidates: dict[str, tuple | None] = {}
+    for key, rate in table.items():
+        alias = key.rsplit("/", 1)[-1]
+        if alias == key or alias in table:
+            continue
+        held = candidates.get(alias, "unset")
+        if held == "unset":
+            candidates[alias] = rate
+        elif held is not None and held != rate:
+            candidates[alias] = None
+    for alias, rate in candidates.items():
+        if rate is not None:
+            table[alias] = rate
+    return table, status
+
+
+def lookup_rate(table: dict, model: str) -> tuple | None:
+    key = model.strip().lower().split("[", 1)[0]
+    bare = key.rsplit("/", 1)[-1]
+    if not bare or bare in UNPRICEABLE:
+        return None
+    return table.get(key)
+
+
+def price(table: dict, rec: tuple) -> tuple[float, float, bool]:
+    """Returns (cost, cache_savings, unpriced)."""
+    rate = lookup_rate(table, rec[MODEL])
+    savings = rec[CACHED] * (rate[0] - rate[2]) if rate else 0.0
+    if rec[RCOST] is not None:
+        return float(rec[RCOST]), savings, False
+    if rate is None:
+        return 0.0, 0.0, True
+    cc1h = min(rec[CC1H], rec[CCREATE])
+    cost = (
+        rec[UNCACHED] * rate[0]
+        + rec[CACHED] * rate[2]
+        + (rec[CCREATE] - cc1h) * rate[3]
+        + cc1h * rate[4]
+        + rec[OUTPUT] * rate[1]
+    )
+    return cost, savings, False
+
+
+# ---------------------------------------------------------------- aggregation
+
+
+class Bucket:
+    __slots__ = ("uncached", "cached", "ccreate", "output", "cost", "savings", "records", "unpriced", "sessions")
+
+    def __init__(self) -> None:
+        self.uncached = self.cached = self.ccreate = self.output = 0
+        self.cost = self.savings = 0.0
+        self.records = self.unpriced = 0
+        self.sessions: set[str] = set()
+
+    @property
+    def tokens(self) -> int:
+        return self.uncached + self.cached + self.ccreate + self.output
+
+    def add(self, rec: tuple, cost: float, savings: float, unpriced: bool) -> None:
+        self.uncached += rec[UNCACHED]
+        self.cached += rec[CACHED]
+        self.ccreate += rec[CCREATE]
+        self.output += rec[OUTPUT]
+        self.cost += cost
+        self.savings += savings
+        self.records += 1
+        self.unpriced += unpriced
+        if rec[SESSION]:
+            self.sessions.add(rec[SESSION])
+
+
+PERIOD_FMT = {"minute": "%Y-%m-%dT%H:%M", "hour": "%Y-%m-%dT%H", "day": "%Y-%m-%d"}
+
+
+def dedupe(records: list[tuple]) -> list[tuple]:
+    """Time-sorted records with one entry per Claude message.
+
+    Claude Code writes one line per content block, each repeating the parent
+    message's usage. Through a proxy the first of those (the thinking block)
+    can carry a provisional usage with the whole prompt as uncached input and
+    no cache fields, so the last line per message is the one to keep; ccusage
+    lands on the same figures.
+    """
+    records.sort(key=lambda r: r[TS])
+    unique: dict[str, tuple] = {}
+    passthrough: list[tuple] = []
+    for rec in records:
+        if rec[DEDUPE] is None:
+            passthrough.append(rec)
+        else:
+            unique[rec[DEDUPE]] = rec
+    deduped = passthrough + list(unique.values())
+    deduped.sort(key=lambda r: r[TS])
+    return deduped
+
+
+def aggregate(records: list[tuple], rates: dict, since_ms: int, until_ms: int, bin: str):
+    by_period: dict[str, dict[str, Bucket]] = defaultdict(lambda: defaultdict(Bucket))
+    by_model: dict[tuple[str, str], Bucket] = defaultdict(Bucket)
+    by_provider: dict[str, Bucket] = defaultdict(Bucket)
+    total = Bucket()
+    for rec in dedupe(records):
+        if rec[TS] < since_ms or rec[TS] >= until_ms:
+            continue
+        local = datetime.fromtimestamp(rec[TS] / 1000).astimezone()
+        period = local.strftime(PERIOD_FMT[bin])
+        cost, savings, unpriced = price(rates, rec)
+        for b in (by_period[period][rec[PROV]], by_model[(rec[PROV], rec[MODEL])], by_provider[rec[PROV]], total):
+            b.add(rec, cost, savings, unpriced)
+    return by_period, by_model, by_provider, total
+
+
+# ------------------------------------------------------------------ rendering
+
+ANSI = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+COLORS = {"claude": "38;5;173", "codex": "38;5;245"}
+ICON = {"claude": "✳", "codex": "⬡"}
+LABEL = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def c(code: str, s: str) -> str:
+    return f"\x1b[{code}m{s}\x1b[0m" if ANSI else s
+
+
+def dim(s: str) -> str:
+    return c("2", s)
+
+
+def bold(s: str) -> str:
+    return c("1", s)
+
+
+def fmt_usd(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def render_chart(labels: list[str], series: dict[str, list[float]], width: int, height: int) -> list[str]:
+    """Stacked bar chart in eighth-block glyphs. Codex sits under Claude, as on the T3 page."""
+    n = len(labels)
+    order = [p for p in ("codex", "claude") if p in series]
+    totals = [sum(series[p][i] for p in order) for i in range(n)]
+    peak = max(totals) if totals else 0.0
+    fmt = fmt_usd
+    axis_labels = {height - 1: fmt(peak), height // 2: fmt(peak * (height // 2 + 1) / height), 0: "0"}
+    axis_w = max(len(v) for v in axis_labels.values())
+    plot_w = max(1, width - axis_w - 1)
+    cw = max(1, plot_w // n)
+    bar_w = cw - 1 if cw >= 3 else cw
+    units_per_row = 8
+    scale = (height * units_per_row) / peak if peak > 0 else 0.0
+    partial = " ▁▂▃▄▅▆▇█"
+    rows: list[str] = []
+    for row in range(height - 1, -1, -1):
+        lo = row * units_per_row
+        line = dim(f"{axis_labels.get(row, ''):<{axis_w}} ")
+        for i in range(n):
+            top = totals[i] * scale
+            filled = max(0.0, min(float(units_per_row), top - lo))
+            if filled <= 0:
+                line += " " * cw
+                continue
+            # Whichever series covers the middle of the filled part owns the cell's color.
+            mid = lo + filled / 2
+            base = 0.0
+            owner = order[-1]
+            for p in order:
+                nxt = base + series[p][i] * scale
+                if mid < nxt:
+                    owner = p
+                    break
+                base = nxt
+            glyph = partial[int(round(filled))]
+            line += c(COLORS[owner], glyph * bar_w) + " " * (cw - bar_w)
+        rows.append(line)
+    rows.append(dim(" " * axis_w + " " + "─" * (n * cw)))
+    xl = [" "] * (n * cw)
+
+    def put(idx: int, text: str, align_right: bool = False) -> None:
+        start = idx * cw
+        if align_right:
+            start = start + cw - len(text)
+        start = max(0, min(start, n * cw - len(text)))
+        for k, ch in enumerate(text):
+            if 0 <= start + k < len(xl):
+                xl[start + k] = ch
+
+    if n:
+        put(0, labels[0])
+        if n > 2:
+            put(n // 2, labels[n // 2])
+        put(n - 1, labels[-1], align_right=True)
+    rows.append(dim(" " * axis_w + " " + "".join(xl)))
+    return rows
+
+
+def period_labels(keys: list[str]) -> list[str]:
+    return [datetime.strptime(k, PERIOD_FMT["minute"]).strftime("%H:%M") for k in keys]
+
+
+def render(args: argparse.Namespace) -> None:
+    """Trailing-hour burn rate: per-minute cost chart plus rates over the last 5/15/60 minutes."""
+    now = datetime.now().astimezone()
+    minute = now.replace(second=0, microsecond=0)
+    start = minute - timedelta(minutes=59)
+    keys = [(start + timedelta(minutes=i)).strftime(PERIOD_FMT["minute"]) for i in range(60)]
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    since_ms = int(day_start.timestamp() * 1000)
+    hour_ms = int(start.timestamp() * 1000)
+    until_ms = int(now.timestamp() * 1000) + 1
+
+    t0 = time.time()
+    rates, rate_status = load_rates(args.offline)
+    records, stats = collect_records(since_ms, verbose=not args.watch and not args.json, config=load_config())
+    by_minute, hour_by_model, hour_by_provider, _hour = aggregate(records, rates, hour_ms, until_ms, "minute")
+    _, day_by_model, by_provider, today = aggregate(records, rates, since_ms, until_ms, "minute")
+    scan_s = time.time() - t0
+
+    width = args.width or shutil.get_terminal_size((120, 40)).columns
+    metric = lambda b: b.cost  # noqa: E731
+    fmt = fmt_usd
+    unit = "/h"
+
+    def trailing(minutes: int) -> float:
+        cut = (minute - timedelta(minutes=minutes - 1)).strftime(PERIOD_FMT["minute"])
+        return sum(metric(b) for k, provs in by_minute.items() if k >= cut for b in provs.values())
+
+    # "Today" is the calendar day, so a pace projects over the hours left until midnight, not a flat 24.
+    elapsed_h = (now - day_start).total_seconds() / 3600
+    remaining_h = 24 - elapsed_h
+    so_far = metric(today)
+    day_avg = so_far / elapsed_h if elapsed_h > 0 else 0.0
+    rows = [
+        ("Last 5 min", trailing(5) * 12),
+        ("Last 15 min", trailing(15) * 4),
+        ("Last 60 min", trailing(60)),
+        (f"Today's average ({elapsed_h:.1f} h)", day_avg),
+    ]
+    model_rows = sorted(((k, b) for k, b in day_by_model.items() if metric(b) > 0), key=lambda kv: -metric(kv[1]))
+
+    out: list[str] = []
+    span = f"{start.strftime('%H:%M')} to {now.strftime('%H:%M')}"
+    out.append(f"{bold('Burn rate')} {dim('/')} {span}    {dim('Last hour')} {dim('·')} {dim('updated ' + now.strftime('%H:%M:%S'))}")
+    out.append("")
+
+    # One column grid for every section so the dollar figures line up down the whole header.
+    name_w = max([len(lab) for lab, _ in rows] + [len(m) + 2 for (_, m) in day_by_model] + [len(LABEL[p]) + 4 for p in LABEL]) + 4
+    mid_w = 14
+    val_w = 12
+
+    def line(name: str, mid: str, val: str) -> str:
+        return f"{name:<{name_w + len(name) - len(strip_ansi(name))}}{mid:>{mid_w + len(mid) - len(strip_ansi(mid))}}{val:>{val_w + len(val) - len(strip_ansi(val))}}"
+
+    out.append(line(dim("Pace"), dim("Rate"), dim("Today")))
+    for lab, rate in rows:
+        out.append(line(lab, bold(fmt(rate) + unit), fmt(so_far + rate * remaining_h)))
+    out.append("")
+    out.append(line(bold("Today so far"), "", fmt(so_far)))
+    out.append("")
+    out.append(line(dim("Provider"), dim("Last 60 min"), dim("Today")))
+    for p in ("claude", "codex"):
+        b = by_provider.get(p)
+        if b is None:
+            continue
+        hour_p = metric(hour_by_provider.get(p, Bucket()))
+        out.append(line(f"{c(COLORS[p], ICON[p])} {bold(LABEL[p])}", fmt(hour_p) + unit, fmt(metric(b))))
+    out.append("")
+    out.append(line(dim("Model"), dim("Last 60 min"), dim("Today")))
+    for (p, m), b in model_rows:
+        hour_m = metric(hour_by_model.get((p, m), Bucket()))
+        out.append(line(f"{c(COLORS[p], ICON[p])} {m}", fmt(hour_m) + unit if hour_m else dim("idle"), fmt(metric(b))))
+    out.append("")
+
+    out.append(bold("Per-minute cost"))
+    series = {p: [metric(by_minute.get(k, {}).get(p, Bucket())) for k in keys] for p in ("claude", "codex") if p in by_provider}
+    if series and any(v for s in series.values() for v in s):
+        out.extend(render_chart(period_labels(keys), series, width, args.height))
+    else:
+        out.append(dim("  no usage in the last hour"))
+    out.append("")
+    out.append(dim(f"{stats['files']} transcripts ({stats['parsed']} parsed, rest cached) · rates {rate_status} · {scan_s:.1f}s"))
+
+    if args.json:
+        # One frame for the menu bar app: the screen itself (ANSI colors included)
+        # plus the headline numbers it shows in the menu bar.
+        doc = {
+            "frame": "\n".join(out),
+            "rate_5m": trailing(5) * 12,
+            "rate_15m": trailing(15) * 4,
+            "rate_60m": trailing(60),
+            "today": so_far,
+            "projected_today": so_far + trailing(60) * remaining_h,
+            "updated": now.isoformat(timespec="seconds"),
+        }
+        sys.stdout.write(json.dumps(doc) + "\n")
+        sys.stdout.flush()
+        return
+    if args.watch:
+        sys.stdout.write("\x1b[H\x1b[2J")
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
+
+def strip_ansi(s: str) -> str:
+    import re
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="ccburn", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--once", action="store_true", help="print one frame and exit instead of redrawing")
+    ap.add_argument("--interval", type=int, default=60, metavar="SECONDS", help="seconds between redraws (default 60)")
+    ap.add_argument("--height", type=int, default=12, help="chart height in rows")
+    ap.add_argument("--offline", action="store_true", help="never fetch the LiteLLM rate table")
+    ap.add_argument("--width", type=int, default=0, metavar="COLUMNS", help="screen width in columns (default: the terminal's)")
+    ap.add_argument("--json", action="store_true", help="print one frame as JSON (colored screen plus headline numbers) and exit")
+    args = ap.parse_args()
+    args.watch = not (args.once or args.json)
+    if args.json:
+        global ANSI
+        ANSI = True
+    if not args.watch:
+        render(args)
+        return
+    try:
+        while True:
+            render(args)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
