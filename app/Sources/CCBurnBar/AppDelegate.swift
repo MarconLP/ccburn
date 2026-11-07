@@ -33,15 +33,26 @@ enum TitleMetric: String, CaseIterable {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+/// The menu bar item opens one native menu: the burn-rate panel as a view item,
+/// then the settings. Clicking works like any system menu bar extra (Wi-Fi,
+/// Battery): the menu drops from the menu bar on mouse-down, with the system's
+/// menu glass behind it and no popover arrow.
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static let chartHeight = 12
     static let refreshInterval: TimeInterval = 60
+    /// Padding around the panel in `--snapshot` PNGs.
     static let padding: CGFloat = 16
+    /// Insets of the panel inside the menu. The horizontal one lines the text up
+    /// with the titles of the menu items below it.
+    static let menuInsets = NSEdgeInsets(top: 6, left: 14, bottom: 8, right: 14)
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let popover = NSPopover()
+    private let menu = NSMenu()
     private let terminal = TerminalView()
-    private let panel = NSViewController()
+    private let panelItem = NSMenuItem()
+    private let panelView = NSView()
+    private let titleMenu = NSMenu()
+    private let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
     private var engine: Engine?
     private var timer: Timer?
     private var running = false
@@ -59,26 +70,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.title = "ccburn"
             button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            button.target = self
-            button.action = #selector(statusItemClicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        // No background of its own: the popover's glass shows through. An opaque fill
-        // covers only the content view and leaves glass strips above and below it.
-        let container = NSView()
-        terminal.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(terminal)
-        NSLayoutConstraint.activate([
-            terminal.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Self.padding),
-            terminal.topAnchor.constraint(equalTo: container.topAnchor, constant: Self.padding),
-        ])
-        panel.view = container
-        popover.contentViewController = panel
-        popover.behavior = .transient
-        popover.animates = false
-
-        terminal.menu = makeMenu()
+        panelView.addSubview(terminal)
+        panelItem.view = panelView
+        buildMenu()
+        statusItem.menu = menu
         show(message: "\u{1B}[2mloading…\u{1B}[0m")
 
         do {
@@ -93,9 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
         refresh()
 
-        // Development aid: open the panel at launch so it can be screenshotted.
+        // Development aid: open the menu at launch so it can be screenshotted.
         if CommandLine.arguments.contains("--show-panel") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.togglePopover() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.statusItem.button?.performClick(nil) }
         }
     }
 
@@ -147,68 +144,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.title = lastFrame.map(titleMetric.text) ?? "ccburn"
     }
 
+    /// Sizes the panel item to the text. An open menu follows the new size.
     private func resizePanel() {
         let size = terminal.intrinsicContentSize
-        let padded = NSSize(width: size.width + 2 * Self.padding, height: size.height + 2 * Self.padding)
-        panel.preferredContentSize = padded
-        popover.contentSize = padded
-    }
-
-    // MARK: Clicks
-
-    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        let event = NSApp.currentEvent
-        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
-            showMenu()
-        } else {
-            togglePopover()
-        }
-    }
-
-    private func togglePopover() {
-        if popover.isShown {
-            popover.performClose(nil)
-            return
-        }
-        guard let button = statusItem.button else { return }
-        NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        popover.contentViewController?.view.window?.makeKey()
-        if Date().timeIntervalSince(lastRun) > 5 { refresh() }
-    }
-
-    private func showMenu() {
-        popover.performClose(nil)
-        statusItem.menu = makeMenu()
-        statusItem.button?.performClick(nil)
-        statusItem.menu = nil
+        let i = Self.menuInsets
+        terminal.frame = NSRect(x: i.left, y: i.bottom, width: size.width, height: size.height)
+        panelView.setFrameSize(NSSize(width: size.width + i.left + i.right, height: size.height + i.top + i.bottom))
     }
 
     // MARK: Menu
 
-    private func makeMenu() -> NSMenu {
-        let menu = NSMenu()
-        menu.addItem(item("Refresh", #selector(refresh), key: "r"))
+    private func buildMenu() {
+        menu.delegate = self
+        menu.addItem(panelItem)
         menu.addItem(.separator())
+        menu.addItem(item("Refresh", #selector(refresh), key: "r"))
 
-        let titleMenu = NSMenu()
         for metric in TitleMetric.allCases {
             let it = item(metric.label, #selector(pickTitleMetric(_:)))
             it.representedObject = metric.rawValue
-            it.state = metric == titleMetric ? .on : .off
             titleMenu.addItem(it)
         }
         let titleItem = NSMenuItem(title: "Menu Bar Shows", action: nil, keyEquivalent: "")
         titleItem.submenu = titleMenu
         menu.addItem(titleItem)
 
-        let login = item("Launch at Login", #selector(toggleLaunchAtLogin))
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(login)
+        loginItem.target = self
+        menu.addItem(loginItem)
 
         menu.addItem(.separator())
         menu.addItem(item("Quit ccburn", #selector(NSApplication.terminate(_:)), key: "q", target: NSApp))
-        return menu
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        for it in titleMenu.items {
+            it.state = it.representedObject as? String == titleMetric.rawValue ? .on : .off
+        }
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        if Date().timeIntervalSince(lastRun) > 5 { refresh() }
     }
 
     private func item(_ title: String, _ action: Selector, key: String = "", target: AnyObject? = nil) -> NSMenuItem {
@@ -221,7 +199,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let raw = sender.representedObject as? String, let metric = TitleMetric(rawValue: raw) else { return }
         titleMetric = metric
         updateTitle()
-        terminal.menu = makeMenu()
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -237,6 +214,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.informativeText = error.localizedDescription
             alert.runModal()
         }
-        terminal.menu = makeMenu()
     }
 }

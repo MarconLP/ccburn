@@ -33,7 +33,7 @@ Needs only `python3` (3.9 or newer), no packages. `make cli` links `~/.local/bin
 
 ## Menu bar app
 
-`app/` is a small AppKit app that shows the same screen in a menu bar popover. It runs the bundled
+`app/` is a small AppKit app that shows the same screen in a menu bar menu. It runs the bundled
 `ccburn --json` every 60 seconds and draws the frame on a character grid, the way a terminal does.
 It draws the per-minute chart itself, with bars thinner than a character, so the chart fits the
 tables' width instead of needing a column per minute.
@@ -43,8 +43,9 @@ make install        # build, copy to /Applications, start
 /Applications/ccburn.app/Contents/MacOS/ccburn --login-item on   # start at login (also in the menu); off | status
 ```
 
-- Click the number in the menu bar to open the screen. Right-click for the menu: refresh, what it shows
-  (last 60 min rate, last 5 min rate or today so far), launch at login, quit.
+- Click the number in the menu bar to open the screen. It opens like any system menu bar item, with the
+  settings below it: refresh, what the menu bar shows (last 60 min rate, last 5 min rate or today so far),
+  launch at login, quit.
 - Needs macOS 13 or newer, the Xcode Command Line Tools to build, and `python3` on the machine at run time.
 - The build is signed ad hoc for local use. There are no prebuilt releases.
 
