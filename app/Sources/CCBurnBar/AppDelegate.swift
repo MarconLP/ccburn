@@ -33,15 +33,6 @@ enum TitleMetric: String, CaseIterable {
     }
 }
 
-/// Opaque panel background. macOS 26 popovers are glass, and text over
-/// whatever window sits behind them is hard to read.
-final class SolidBackgroundView: NSView {
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
-        dirtyRect.fill()
-    }
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static let chartHeight = 12
     static let refreshInterval: TimeInterval = 60
@@ -73,7 +64,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        let container = SolidBackgroundView()
+        // No background of its own: the popover's glass shows through. An opaque fill
+        // covers only the content view and leaves glass strips above and below it.
+        let container = NSView()
         terminal.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(terminal)
         NSLayoutConstraint.activate([
