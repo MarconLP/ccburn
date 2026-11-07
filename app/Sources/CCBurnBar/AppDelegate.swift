@@ -1,19 +1,12 @@
 import AppKit
 import ServiceManagement
 
-/// What the menu bar item shows. It is text only, no icon.
+/// What the menu bar item shows. It is text only, no icon. There is no menu for it;
+/// `defaults write com.github.marconlp.ccburn titleMetric rate5|rate60|today` sets it.
 enum TitleMetric: String, CaseIterable {
     case rate60 = "rate60"
     case rate5 = "rate5"
     case today = "today"
-
-    var label: String {
-        switch self {
-        case .rate60: return "Last 60 min rate"
-        case .rate5: return "Last 5 min rate"
-        case .today: return "Today so far"
-        }
-    }
 
     func text(_ f: Frame) -> String {
         switch self {
@@ -33,26 +26,24 @@ enum TitleMetric: String, CaseIterable {
     }
 }
 
-/// The menu bar item opens one native menu: the burn-rate panel as a view item,
-/// then the settings. Clicking works like any system menu bar extra (Wi-Fi,
-/// Battery): the menu drops from the menu bar on mouse-down, with the system's
-/// menu glass behind it and no popover arrow.
+/// The menu bar item opens a native menu whose only item is the burn-rate panel.
+/// Clicking works like any system menu bar extra (Wi-Fi, Battery): the menu drops
+/// from the menu bar on mouse-down, with the system's menu glass behind it.
+/// It has no settings: the panel refreshes by itself, and the app turns Launch at
+/// Login on at its first launch from /Applications.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static let chartHeight = 12
     static let refreshInterval: TimeInterval = 60
     /// Padding around the panel in `--snapshot` PNGs.
     static let padding: CGFloat = 16
-    /// Insets of the panel inside the menu. The horizontal one lines the text up
-    /// with the titles of the menu items below it.
-    static let menuInsets = NSEdgeInsets(top: 6, left: 14, bottom: 8, right: 14)
+    /// Insets of the panel inside the menu.
+    static let menuInsets = NSEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
     private let terminal = TerminalView()
     private let panelItem = NSMenuItem()
     private let panelView = NSView()
-    private let titleMenu = NSMenu()
-    private let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
     private var engine: Engine?
     private var timer: Timer?
     private var running = false
@@ -62,8 +53,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let defaults = UserDefaults.standard
 
     private var titleMetric: TitleMetric {
-        get { TitleMetric(rawValue: defaults.string(forKey: "titleMetric") ?? "") ?? .rate60 }
-        set { defaults.set(newValue.rawValue, forKey: "titleMetric") }
+        TitleMetric(rawValue: defaults.string(forKey: "titleMetric") ?? "") ?? .rate60
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -74,8 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         panelView.addSubview(terminal)
         panelItem.view = panelView
-        buildMenu()
+        menu.delegate = self
+        menu.addItem(panelItem)
         statusItem.menu = menu
+        enableLaunchAtLoginOnce()
         show(message: "\u{1B}[2mloading…\u{1B}[0m")
 
         do {
@@ -154,65 +146,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Menu
 
-    private func buildMenu() {
-        menu.delegate = self
-        menu.addItem(panelItem)
-        menu.addItem(.separator())
-        menu.addItem(item("Refresh", #selector(refresh), key: "r"))
-
-        for metric in TitleMetric.allCases {
-            let it = item(metric.label, #selector(pickTitleMetric(_:)))
-            it.representedObject = metric.rawValue
-            titleMenu.addItem(it)
-        }
-        let titleItem = NSMenuItem(title: "Menu Bar Shows", action: nil, keyEquivalent: "")
-        titleItem.submenu = titleMenu
-        menu.addItem(titleItem)
-
-        loginItem.target = self
-        menu.addItem(loginItem)
-
-        menu.addItem(.separator())
-        menu.addItem(item("Quit ccburn", #selector(NSApplication.terminate(_:)), key: "q", target: NSApp))
-    }
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        guard menu === self.menu else { return }
-        for it in titleMenu.items {
-            it.state = it.representedObject as? String == titleMetric.rawValue ? .on : .off
-        }
-        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
-    }
-
     func menuWillOpen(_ menu: NSMenu) {
-        guard menu === self.menu else { return }
         if Date().timeIntervalSince(lastRun) > 5 { refresh() }
     }
 
-    private func item(_ title: String, _ action: Selector, key: String = "", target: AnyObject? = nil) -> NSMenuItem {
-        let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        it.target = target ?? self
-        return it
-    }
+    // MARK: Launch at Login
 
-    @objc private func pickTitleMetric(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let metric = TitleMetric(rawValue: raw) else { return }
-        titleMetric = metric
-        updateTitle()
-    }
-
-    @objc private func toggleLaunchAtLogin() {
-        do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Could not change Launch at Login"
-            alert.informativeText = error.localizedDescription
-            alert.runModal()
+    /// Turns Launch at Login on the first time the installed app starts. Only once, so
+    /// `--login-item off` sticks. A build run from elsewhere (build/) is not registered.
+    private func enableLaunchAtLoginOnce() {
+        let key = "launchAtLoginDefaulted"
+        guard !defaults.bool(forKey: key), Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
+        defaults.set(true, forKey: key)
+        if SMAppService.mainApp.status != .enabled {
+            try? SMAppService.mainApp.register()
         }
     }
 }

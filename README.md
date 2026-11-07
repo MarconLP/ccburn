@@ -40,12 +40,14 @@ tables' width instead of needing a column per minute.
 
 ```sh
 make install        # build, copy to /Applications, start
-/Applications/ccburn.app/Contents/MacOS/ccburn --login-item on   # start at login (also in the menu); off | status
+/Applications/ccburn.app/Contents/MacOS/ccburn --login-item off  # stop starting at login; on | status
+defaults write com.github.marconlp.ccburn titleMetric today      # menu bar number: rate60 (default) | rate5 | today
 ```
 
-- Click the number in the menu bar to open the screen. It opens like any system menu bar item, with the
-  settings below it: refresh, what the menu bar shows (last 60 min rate, last 5 min rate or today so far),
-  launch at login, quit.
+- Click the number in the menu bar to open the screen. It opens like any system menu bar item and has
+  no settings: it refreshes every minute and whenever you open it.
+- It starts at login: the first launch from `/Applications` turns that on. There is no Quit item;
+  quit it from Activity Monitor.
 - Needs macOS 13 or newer, the Xcode Command Line Tools to build, and `python3` on the machine at run time.
 - The build is signed ad hoc for local use. There are no prebuilt releases.
 
