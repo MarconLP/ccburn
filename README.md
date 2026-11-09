@@ -67,7 +67,8 @@ config directories, for example one per account, list them in `~/.config/ccburn/
 The menu bar app has no shell environment, so set up extra profiles here rather than through
 environment variables. `CCBURN_CONFIG` points at a different config file.
 
-Caches live in `~/.cache/ccburn/`: the rate table (refreshed daily) and a per-file scan cache.
+Caches live in `~/.cache/ccburn/`: the rate table (refreshed daily, and within the
+hour when a model in use has no rate yet) and a per-file scan cache.
 
 ## Development
 

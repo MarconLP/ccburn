@@ -35,7 +35,9 @@ CONFIG_PATH = Path(
 ).expanduser()
 RATES_CACHE = CACHE_DIR / "litellm.json"
 SCAN_CACHE = CACHE_DIR / "scan-cache-v2.pickle"
+RATES_RETRY = CACHE_DIR / "litellm.retry"
 RATES_TTL_S = 24 * 3600
+RATES_RETRY_S = 3600
 MTIME_SLACK_MS = 36 * 3600 * 1000
 FORK_COPY_MAX_GAP_MS = 1000
 UNPRICEABLE = {"<synthetic>", "synthetic", "opus", "sonnet", "haiku", "fable"}
@@ -305,10 +307,10 @@ def collect_records(since_ms: int, verbose: bool, config: dict) -> tuple[list[tu
 # -------------------------------------------------------------------- pricing
 
 
-def load_rates(offline: bool) -> tuple[dict[str, tuple[float, float, float, float, float]], str]:
+def load_rates(offline: bool, ttl_s: int = RATES_TTL_S) -> tuple[dict[str, tuple[float, float, float, float, float]], str]:
     doc = None
     status = "unavailable"
-    fresh = RATES_CACHE.exists() and time.time() - RATES_CACHE.stat().st_mtime < RATES_TTL_S
+    fresh = RATES_CACHE.exists() and time.time() - RATES_CACHE.stat().st_mtime < ttl_s
     if not offline and not fresh:
         try:
             with urllib.request.urlopen(LITELLM_URL, timeout=10) as r:
@@ -367,6 +369,32 @@ def lookup_rate(table: dict, model: str) -> tuple | None:
     if not bare or bare in UNPRICEABLE:
         return None
     return table.get(key)
+
+
+def missing_rates(table: dict, records: list[tuple], since_ms: int) -> set[str]:
+    """Models used since since_ms that the rate table should price but does not."""
+    missing: set[str] = set()
+    for rec in records:
+        if rec[TS] < since_ms or rec[RCOST] is not None or rec[MODEL] in missing:
+            continue
+        bare = rec[MODEL].strip().lower().split("[", 1)[0].rsplit("/", 1)[-1]
+        if bare and bare not in UNPRICEABLE and lookup_rate(table, rec[MODEL]) is None:
+            missing.add(rec[MODEL])
+    return missing
+
+
+def retry_due() -> bool:
+    """True at most once per RATES_RETRY_S, so an unknown model cannot refetch the table on every redraw."""
+    try:
+        if time.time() - RATES_RETRY.stat().st_mtime < RATES_RETRY_S:
+            return False
+    except OSError:
+        pass
+    try:
+        _write_atomic(RATES_RETRY, b"")
+    except OSError:
+        pass
+    return True
 
 
 def price(table: dict, rec: tuple) -> tuple[float, float, bool]:
@@ -463,6 +491,7 @@ def aggregate(records: list[tuple], rates: dict, since_ms: int, until_ms: int, b
 ANSI = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 COLOR_INDEX = {"claude": 173, "codex": 245}
 COLORS = {p: f"38;5;{n}" for p, n in COLOR_INDEX.items()}
+WARN = "38;5;196"  # pure red: spend the totals are missing
 ICON = {"claude": "✳", "codex": "⬡"}
 LABEL = {"claude": "Claude Code", "codex": "Codex"}
 
@@ -566,6 +595,10 @@ def render(args: argparse.Namespace) -> None:
     t0 = time.time()
     rates, rate_status = load_rates(args.offline)
     records, stats = collect_records(since_ms, verbose=not args.watch and not args.json, config=load_config())
+    # A model released after the last daily fetch has no rate yet and would count as $0
+    # until the cache expires, so a miss refetches the table early.
+    if not args.offline and missing_rates(rates, records, since_ms) and retry_due():
+        rates, rate_status = load_rates(False, ttl_s=RATES_RETRY_S)
     by_minute, hour_by_model, hour_by_provider, _hour = aggregate(records, rates, hour_ms, until_ms, "minute")
     _, day_by_model, by_provider, today = aggregate(records, rates, since_ms, until_ms, "minute")
     scan_s = time.time() - t0
@@ -590,7 +623,11 @@ def render(args: argparse.Namespace) -> None:
         ("Last 60 min", trailing(60)),
         (f"Today's average ({elapsed_h:.1f} h)", day_avg),
     ]
-    model_rows = sorted(((k, b) for k, b in day_by_model.items() if metric(b) > 0), key=lambda kv: -metric(kv[1]))
+    # A model with tokens but no rate stays in the table, marked, so missing spend is never silent.
+    model_rows = sorted(
+        ((k, b) for k, b in day_by_model.items() if metric(b) > 0 or (b.unpriced and b.tokens)),
+        key=lambda kv: -metric(kv[1]),
+    )
 
     # One column grid for every section so the dollar figures line up down the whole header.
     name_w = max([len(lab) for lab, _ in rows] + [len(m) + 2 for (_, m) in day_by_model] + [len(LABEL[p]) + 4 for p in LABEL]) + 4
@@ -633,8 +670,12 @@ def render(args: argparse.Namespace) -> None:
     out.append("")
     out.append(line(dim("Model"), dim("Last 60 min"), dim("Today")))
     for (p, m), b in model_rows:
+        name = f"{c(COLORS[p], ICON[p])} {m}"
+        if b.unpriced and not metric(b):
+            out.append(line(name, "", c(WARN, "no rate")))
+            continue
         hour_m = metric(hour_by_model.get((p, m), Bucket()))
-        out.append(line(f"{c(COLORS[p], ICON[p])} {m}", fmt(hour_m) + unit if hour_m else dim("idle"), fmt(metric(b))))
+        out.append(line(name, fmt(hour_m) + unit if hour_m else dim("idle"), fmt(metric(b))))
     out.append("")
 
     out.append(bold("Per-minute cost"))
