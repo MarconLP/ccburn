@@ -2,6 +2,15 @@
 
 A live burn-rate screen for Claude Code and Codex spend, in the terminal or in the macOS menu bar.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/demo-dark.png">
+    <img src="docs/demo-light.png" width="423" alt="The ccburn panel: spend rate over the last 5, 15 and 60 minutes, today's total, provider and model tables, and a stacked per-minute cost chart of the last hour">
+  </picture>
+  <br>
+  <sub>The menu bar panel. The figures are made up.</sub>
+</p>
+
 ccburn reads the transcripts the Claude Code and Codex CLIs already write to disk, prices every
 message against [LiteLLM's rate table](https://github.com/BerriAI/litellm), and draws one screen:
 
