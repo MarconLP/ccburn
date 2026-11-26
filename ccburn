@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""ccburn: live burn-rate dashboard for Claude Code and Codex spend.
+"""ccburn: live burn-rate dashboard for Claude Code, Codex and Antigravity spend.
 
 Reads the Claude Code and Codex CLIs' own on-disk transcripts (scan/price/
-de-dupe pipeline ported from t3code `apps/server/src/usage/`), prices them
-against LiteLLM's rate table, and redraws one screen: trailing 5/15/60 min
+de-dupe pipeline ported from t3code `apps/server/src/usage/`) and the
+conversation databases of Antigravity, Google's agent for the Gemini models,
+prices them against LiteLLM's rate table, and redraws one screen: trailing 5/15/60 min
 rates with an end-of-day projection, today's total, per-provider and per-model
 tables, and a per-minute stacked chart of the last hour.
 
 Costs are API-equivalent estimates, not what a subscription bills.
 
-Extra Claude Code config dirs (one per profile) and Codex homes go in
-~/.config/ccburn/config.json, see config.example.json.
+Extra Claude Code config dirs (one per profile), Codex homes and Antigravity
+data dirs go in ~/.config/ccburn/config.json, see config.example.json.
 """
 
 from __future__ import annotations
@@ -19,7 +20,9 @@ import argparse
 import json
 import os
 import pickle
+import re
 import shutil
+import sqlite3
 import sys
 import time
 import urllib.request
@@ -200,6 +203,423 @@ def scan_file(path: Path, provider: str) -> list[tuple]:
     return out
 
 
+# ---------------------------------------------------------------- antigravity
+#
+# Antigravity (Google's agent CLI and IDE, the way T3 Code runs Gemini) keeps one
+# SQLite database per conversation, with protobuf blobs. Reader ported from t3code
+# `apps/server/src/provider/Drivers/antigravityUsageReader.ts`.
+
+# Names for model IDs a record carries without a name. Names found in the scanned
+# metadata win over this table.
+AGY_MODEL_IDS = {
+    246: "gemini-2.5-pro",
+    312: "gemini-2.5-flash",
+    313: "gemini-2.5-flash-thinking",
+    329: "gemini-2.5-flash-thinking",
+    330: "gemini-2.5-flash-lite",
+    281: "claude-sonnet-4",
+    282: "claude-sonnet-4",
+    290: "claude-opus-4",
+    291: "claude-opus-4",
+    333: "claude-sonnet-4-5",
+    334: "claude-sonnet-4-5",
+    340: "claude-haiku-4-5",
+    341: "claude-haiku-4-5",
+    342: "gpt-oss-120b-medium",
+    1026: "claude-opus-4-6",
+    1035: "claude-sonnet-4-6",
+    1016: "gemini-3.1-pro",
+    1036: "gemini-3.1-pro",
+    1037: "gemini-3.1-pro",
+    1018: "gemini-3-flash-preview",
+    1084: "gemini-3-flash-preview",
+    1047: "gemini-3-flash-preview",
+    1020: "gemini-3.5-flash-medium",
+    1021: "gemini-3.1-flash-image",
+    1050: "gemini-3.1-flash-lite",
+    1071: "gemini-3.6-flash-high",
+    1072: "gemini-3.6-flash-medium",
+    1073: "gemini-3.6-flash-low",
+    1132: "gemini-3.5-flash-high",
+    1133: "gemini-3.5-flash-high",
+    1187: "gemini-3.5-flash-extra-low",
+    1196: "gemini-3.6-flash",
+    1266: "gemini-3.6-flash",
+    1298: "gemini-3.7-flash-high",
+    1299: "gemini-3.7-flash-medium",
+    1300: "gemini-3.7-flash-low",
+    1301: "gemini-3.7-flash-tiered",
+    1318: "gemini-3.8-flash-high",
+    1319: "gemini-3.8-flash-medium",
+    1320: "gemini-3.8-flash-low",
+    1322: "gemini-3.8-flash-tiered",
+    1402: "claude-opus-5-5",
+    1417: "gemini-4-argon",
+    1418: "gemini-4-argon",
+    1419: "gemini-4-argon",
+    1427: "gemini-4-carbon",
+    1437: "gemini-4-carbon",
+    1525: "gemini-4-hydrogen",
+    1526: "gemini-4-hydrogen",
+    1527: "gemini-4-hydrogen",
+    1532: "gemini-4-neon",
+    1533: "gemini-4-neon",
+    1537: "gemini-pro-orchestrator-neon",
+    1667: "gemini-pro-orchestrator",
+    1669: "gemini-4-hydrogen-orchestrator",
+}
+
+_AGY_VARIANT = re.compile(r"-(?:extra-low|low|medium|high|tiered|control|thinking|agent|orchestrator|trial|n|r)$")
+_AGY_FLASH3 = re.compile(r"^gemini-3-flash-(?:agent(?:-[ab])?|[ab])$")
+_AGY_CONCRETE = re.compile(r"^(?:gemini-\d|claude-(?:sonnet|opus|haiku)-\d|gpt-)")
+_AGY_ROUTED = {
+    "gemini-3.7-flash-safety-le": "gemini-3.7-flash",
+    "gemini-pro-orchestrator-neon": "gemini-4-neon",
+    "gemini-pro-orchestrator-g1-pro": "gemini-4-argon",
+    "gemini-pro-orchestrator": "gemini-4-carbon",
+}
+_PB_MAX_INT = 2**53 - 1
+_AGY_AMBIGUOUS = ""  # a model ID that two databases name differently
+
+
+def antigravity_rate_model(model: str) -> str:
+    """The rate-table name of an Antigravity model: effort and routing variants bill as their base model."""
+    if _AGY_FLASH3.match(model):
+        return "gemini-3.5-flash"
+    if model in _AGY_ROUTED:
+        return _AGY_ROUTED[model]
+    base = _AGY_VARIANT.sub("", model)
+    return "gemini-3-flash-preview" if base == "gemini-3-flash" else base
+
+
+def _pb(data: bytes) -> dict[int, list]:
+    """The top-level fields of one protobuf message: varints as int, length-delimited fields as bytes."""
+    out: dict[int, list] = {}
+    off, n = 0, len(data)
+    while off < n:
+        tag = shift = 0
+        while True:
+            byte = data[off]
+            off += 1
+            tag |= (byte & 127) << shift
+            if byte < 128:
+                break
+            shift += 7
+        number, wire = tag >> 3, tag & 7
+        if number == 0:
+            raise ValueError("invalid protobuf field")
+        if wire == 0:
+            value = shift = 0
+            while True:
+                byte = data[off]
+                off += 1
+                value |= (byte & 127) << shift
+                if byte < 128:
+                    break
+                shift += 7
+                if shift > 63:
+                    raise ValueError("invalid protobuf varint")
+        elif wire == 2:
+            length = shift = 0
+            while True:
+                byte = data[off]
+                off += 1
+                length |= (byte & 127) << shift
+                if byte < 128:
+                    break
+                shift += 7
+            if length > n - off:
+                raise ValueError("truncated protobuf field")
+            value = data[off : off + length]
+            off += length
+        elif wire in (1, 5):
+            off += 8 if wire == 1 else 4
+            if off > n:
+                raise ValueError("truncated protobuf field")
+            continue
+        else:
+            raise ValueError("unsupported protobuf wire type")
+        out.setdefault(number, []).append(value)
+    return out
+
+
+def _pb_num(msg: dict, key: int) -> int:
+    v = msg.get(key, (None,))[0]
+    return v if isinstance(v, int) and v <= _PB_MAX_INT else 0
+
+
+def _pb_bytes(msg: dict, key: int) -> bytes | None:
+    v = msg.get(key, (None,))[0]
+    return v if isinstance(v, bytes) else None
+
+
+def _pb_nested(msg: dict, key: int) -> dict:
+    v = _pb_bytes(msg, key)
+    return {} if v is None else _pb(v)
+
+
+def _pb_text(msg: dict, key: int) -> str:
+    v = _pb_bytes(msg, key)
+    return "" if v is None else v.decode("utf-8").strip()
+
+
+def _pb_ts(msg: dict) -> int | None:
+    seconds = _pb_num(msg, 1)
+    return seconds * 1000 + _pb_num(msg, 2) // 1_000_000 if seconds > 0 else None
+
+
+def _agy_model_name(name: str) -> str:
+    """'Gemini 4 Neon (High)' -> 'gemini-4-neon-high', 'Claude 4.5 Sonnet' -> 'claude-sonnet-4-5'."""
+    if not name:
+        return ""
+    n = re.sub(r"\s+", "-", re.sub(r"\s*\(([^)]*)\)\s*$", r"-\1", name.lower()))
+    if n.startswith("claude-"):
+        n = re.sub(r"^claude-(\d+(?:\.\d+)?)-(sonnet|opus|haiku)", r"claude-\2-\1", n).replace(".", "-")
+    return n
+
+
+def _agy_concrete(model: str) -> bool:
+    return bool(_AGY_CONCRETE.match(model)) and not _AGY_FLASH3.match(model)
+
+
+def _agy_remember(models: dict[int, str], model_id: int, model: str) -> None:
+    held = models.get(model_id)
+    if held is None:
+        models[model_id] = model
+    elif held != model and (not held or not model or antigravity_rate_model(held) != antigravity_rate_model(model)):
+        models[model_id] = _AGY_AMBIGUOUS
+
+
+def _agy_metadata(blob: object, step: bool) -> tuple[str, int, int | None, list[dict]]:
+    """(model, model_id, timestamp_ms, usages) of one generation row or one step's metadata."""
+    if not isinstance(blob, bytes):
+        raise ValueError("invalid metadata blob")
+    root = _pb(blob)
+    if step:
+        data = root
+        model = _pb_nested(data, 24)
+    else:
+        inner = _pb_bytes(root, 1)
+        if inner is None:
+            raise ValueError("missing generation metadata")
+        data = model = _pb(inner)
+    usage = _pb_bytes(data, 9 if step else 4)
+    usages = [] if usage is None else [_pb(usage)]
+    model_id = _pb_num(model, 1 if step else 3) or (_pb_num(usages[0], 1) if usages else 0)
+    for retry in data.get(28 if step else 17, ()):
+        if not isinstance(retry, bytes):
+            raise ValueError("invalid retry metadata")
+        retry_usage = _pb_bytes(_pb(retry), 2)
+        if retry_usage is not None:
+            usages.append(_pb(retry_usage))
+    names = [_agy_model_name(_pb_text(model, k)) for k in ((12, 8) if step else (19, 21))]
+    name = next((x for x in names if _agy_concrete(x)), None)
+    if name is None:
+        name = next((x for x in names if x and not re.match(r"model[_-]", x)), "")
+    if step:
+        ts = _pb_ts(_pb_nested(data, 8)) or _pb_ts(_pb_nested(data, 1))
+    else:
+        ts = _pb_ts(_pb_nested(_pb_nested(data, 9), 4))
+    return name, model_id, ts, usages
+
+
+# Candidate layout: one usage as one database recorded it, before the cross-database merge.
+# ts_ms, model, uncached, cached, cache_create, output, reasoning, model_id, model_quality, keys, ts_quality
+A_TS, A_MODEL, A_UNCACHED, A_CACHED, A_CCREATE, A_OUTPUT, A_REASON, A_MID, A_MQ, A_KEYS, A_TQ = range(11)
+
+
+def _agy_candidates(gens: list, steps: list, traj_ts: int | None, fallback_ts: int) -> list[tuple]:
+    out: list[tuple] = []
+    gen_by_idx = {idx: entry for idx, entry in gens}
+    for is_step, entries in ((True, steps), (False, gens)):
+        for idx, (name, entry_mid, ts, usages) in entries:
+            gen = gen_by_idx.get(idx) if is_step else None
+            for u in usages:
+                mid = _pb_num(u, 1) or entry_mid
+                # A retry can run on another model than the generation or step it belongs to.
+                if name and (mid == 0 or entry_mid == mid):
+                    model = name
+                elif gen is not None and (mid == 0 or gen[1] == mid):
+                    model = gen[0]
+                else:
+                    model = ""
+                thinking = _pb_num(u, 9)
+                output = max(_pb_num(u, 3), thinking + _pb_num(u, 10))
+                uncached, cached, ccreate = _pb_num(u, 2), _pb_num(u, 5), _pb_num(u, 4)
+                if uncached + cached + ccreate + output == 0:
+                    continue
+                keys = tuple(f"{k}:{t}" for k, t in ((k, _pb_text(u, k)) for k in (11, 12, 7)) if t)
+                out.append(
+                    (
+                        ts or traj_ts or fallback_ts,
+                        model,
+                        uncached,
+                        cached,
+                        ccreate,
+                        output,
+                        min(output, thinking),
+                        mid,
+                        4 if _agy_concrete(model) else 1 if model else 0,
+                        keys,
+                        2 if ts is not None else 1 if traj_ts is not None else 0,
+                    )
+                )
+    return out
+
+
+def read_antigravity_db(path: Path, wal: bool, fallback_ts: int) -> tuple[list[tuple], dict[int, str]] | None:
+    """One conversation database's usage candidates and the model names it gives for model IDs.
+
+    None when the database cannot be read right now; it is tried again on the next scan.
+    """
+    # A plain read-only open of a WAL database leaves -shm and -wal files next to it. With no WAL
+    # to read there is nothing a locked read would add, so open it as an immutable file instead.
+    uri = path.as_uri() + ("?mode=ro" if wal else "?immutable=1")
+    try:
+        con = sqlite3.connect(uri, uri=True, timeout=0.1, isolation_level=None)
+    except sqlite3.Error:
+        return None
+    try:
+        con.execute("BEGIN")
+        tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "gen_metadata" not in tables and "steps" not in tables:
+            return [], {}  # not a conversation store, e.g. conversation_summaries.db
+        gens: list = []
+        steps: list = []
+        # A generation row holds the conversation's whole context so far, often megabytes:
+        # rows are decoded one at a time and only their small usage messages are kept.
+        if "gen_metadata" in tables:
+            for idx, blob in con.execute("SELECT idx, data FROM gen_metadata ORDER BY idx"):
+                if not isinstance(idx, int):
+                    raise ValueError("invalid generation index")
+                gens.append((idx, _agy_metadata(blob, False)))
+        traj_ts = None
+        if "trajectory_metadata_blob" in tables:
+            for (blob,) in con.execute("SELECT data FROM trajectory_metadata_blob"):
+                if not isinstance(blob, bytes):
+                    raise ValueError("invalid trajectory metadata")
+                if traj_ts is None:
+                    traj_ts = _pb_ts(_pb_nested(_pb(blob), 2))
+        if "steps" in tables:
+            for idx, blob in con.execute("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx"):
+                if not isinstance(idx, int):
+                    raise ValueError("invalid step index")
+                steps.append((idx, _agy_metadata(blob, True)))
+        models: dict[int, str] = {}
+        for _idx, (name, mid, _ts, _usages) in gens + steps:
+            if mid > 0 and _agy_concrete(name):
+                _agy_remember(models, mid, name)
+        return _agy_candidates(gens, steps, traj_ts, fallback_ts), models
+    except (sqlite3.Error, ValueError, IndexError):
+        return None
+    finally:
+        con.close()
+
+
+def merge_antigravity(files: list[tuple[str, list[tuple], dict[int, str]]]) -> list[tuple]:
+    """Usage records from every database's candidates, each request counted once.
+
+    A request shows up in a step and in its generation, and again in every copy of the
+    conversation (a backup, a second profile). Candidates that share a response ID are one
+    request: it takes the largest count of each token type, the best model name and the
+    best timestamp any of them has.
+    """
+    models: dict[int, str] = {}
+    for _session, _cands, file_models in files:
+        for mid, name in file_models.items():
+            _agy_remember(models, mid, name)
+
+    # Per group: [session, ts, model, uncached, cached, ccreate, output, reasoning, mq, tq, parent, size, owner]
+    G_SESSION, G_TS, G_MODEL, G_TOKENS, G_MQ, G_TQ, G_PARENT, G_SIZE, G_OWNER = 0, 1, 2, slice(3, 8), 8, 9, 10, 11, 12
+    groups: list[list] = []
+    by_key: dict[str, int] = {}
+
+    def find(i: int) -> int:
+        root = i
+        while groups[root][G_PARENT] != root:
+            root = groups[root][G_PARENT]
+        while i != root:
+            groups[i][G_PARENT], i = root, groups[i][G_PARENT]
+        return root
+
+    def merge(left: int, right: int) -> None:
+        a, b = find(left), find(right)
+        if a == b:
+            return
+        if groups[a][G_SIZE] < groups[b][G_SIZE]:
+            a, b = b, a
+        target, source = groups[a], groups[b]
+        first = target if target[G_OWNER] < source[G_OWNER] else source
+        if source[G_MQ] == target[G_MQ]:
+            best_model = first
+        else:
+            best_model = source if source[G_MQ] > target[G_MQ] else target
+        better_time = source[G_TQ] > target[G_TQ] or (source[G_TQ] == target[G_TQ] and source[G_TS] < target[G_TS])
+        best_time = source if better_time else target
+        target[:] = [
+            first[G_SESSION],
+            best_time[G_TS],
+            best_model[G_MODEL],
+            *(max(x, y) for x, y in zip(target[G_TOKENS], source[G_TOKENS])),
+            best_model[G_MQ],
+            best_time[G_TQ],
+            a,
+            target[G_SIZE] + source[G_SIZE],
+            first[G_OWNER],
+        ]
+        source[G_PARENT] = a
+
+    for session, cands, _models in files:
+        for cand in cands:
+            mid, quality = cand[A_MID], cand[A_MQ]
+            learned = models.get(mid)
+            fallback = AGY_MODEL_IDS.get(mid) if learned is None else None
+            model = (
+                (cand[A_MODEL] if quality == 4 else "")
+                or learned
+                or fallback
+                or cand[A_MODEL]
+                or (f"antigravity-model-{mid}" if mid > 0 else "antigravity-unknown")
+            )
+            if quality != 4:
+                quality = 3 if learned else 2 if fallback else quality
+            i = len(groups)
+            groups.append([session, cand[A_TS], model, *cand[A_UNCACHED : A_REASON + 1], quality, cand[A_TQ], i, 1, i])
+            for key in cand[A_KEYS]:
+                held = by_key.get(key)
+                if held is not None:
+                    merge(i, held)
+                by_key[key] = i
+
+    return [
+        ("antigravity", g[G_TS], g[G_MODEL], g[G_SESSION], *g[G_TOKENS], None, None, 0)
+        for i, g in enumerate(groups)
+        if g[G_PARENT] == i
+    ]
+
+
+def antigravity_dirs(config: dict) -> list[Path]:
+    """Every directory that holds Antigravity conversation databases."""
+    home = Path.home()
+    roots = [home / ".gemini" / n for n in ("antigravity", "antigravity-cli", "antigravity-ide", "antigravity-backup")]
+    roots.append(home / ".config" / "antigravity")
+    roots += _paths(os.environ.get("ANTIGRAVITY_DATA_DIR", "").split(","))
+    roots += _paths(config.get("antigravity_data_dirs"))
+    # T3 Code runs Antigravity with one profile of its own per provider instance.
+    t3_home = Path(os.environ.get("T3CODE_HOME") or home / ".t3").expanduser()
+    for state in ("userdata", "dev"):
+        roots += sorted((t3_home / state / "providers" / "antigravity").glob("*/antigravity-acp"))
+    dirs: list[Path] = []
+    for root in roots:
+        nested = root / "conversations"
+        cand = nested if nested.is_dir() else root
+        if cand.is_dir():
+            real = cand.resolve()
+            if real not in dirs:
+                dirs.append(real)
+    return dirs
+
+
 def load_config() -> dict:
     """The optional JSON config. A broken file is reported and ignored, never fatal."""
     try:
@@ -294,6 +714,46 @@ def collect_records(since_ms: int, verbose: bool, config: dict) -> tuple[list[tu
                 live[key] = (stt.st_size, stt.st_mtime_ns, recs)
                 records.extend(recs)
                 stats["files"] += 1
+
+    def stamp(p: str) -> tuple[int, int, int, float] | None:
+        try:
+            s = os.stat(p)
+        except OSError:
+            return None
+        return (s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mtime)
+
+    agy_files: list[tuple[str, list[tuple], dict[int, str]]] = []
+    seen: set[str] = set()
+    for root in antigravity_dirs(config):
+        for dirpath, dirs, files in os.walk(root):
+            dirs.sort()
+            for name in sorted(files):
+                p = Path(dirpath) / name
+                if not name.endswith(".db") or p.is_symlink():
+                    continue
+                key = os.path.realpath(p)
+                db = stamp(key)
+                if db is None or key in seen:
+                    continue
+                seen.add(key)
+                # New rows sit in the -wal file until a checkpoint, without touching the database
+                # itself, and ctime moves on a write even when mtime is put back.
+                wal = stamp(key + "-wal")
+                if max(db[3], wal[3] if wal else 0) < cutoff:
+                    continue
+                mark = (db[:3], wal[:3] if wal else None)
+                hit = cache.get(key)
+                if hit and hit[0] == mark:
+                    data = hit[2]
+                else:
+                    data = read_antigravity_db(Path(key), bool(wal and wal[0]), int(db[3] * 1000))
+                    stats["parsed"] += 1
+                    if data is None:
+                        continue
+                live[key] = (mark, None, data)
+                agy_files.append((name[:-3], data[0], data[1]))
+                stats["files"] += 1
+    records.extend(merge_antigravity(agy_files))
     if verbose and stats["parsed"] and sys.stderr.isatty():
         print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
     try:
@@ -363,11 +823,17 @@ def load_rates(offline: bool, ttl_s: int = RATES_TTL_S) -> tuple[dict[str, tuple
     return table, status
 
 
-def lookup_rate(table: dict, model: str) -> tuple | None:
+def lookup_rate(table: dict, model: str, provider: str = "") -> tuple | None:
     key = model.strip().lower().split("[", 1)[0]
     bare = key.rsplit("/", 1)[-1]
     if not bare or bare in UNPRICEABLE:
         return None
+    if provider == "antigravity":
+        key = antigravity_rate_model(key)
+        # Resellers list some Gemini models at other prices, which leaves the bare name
+        # without a rate. Antigravity is Google's own, so Google's price is the one that applies.
+        if key.startswith("gemini-"):
+            return table.get(f"gemini/{key}") or table.get(key)
     return table.get(key)
 
 
@@ -378,7 +844,7 @@ def missing_rates(table: dict, records: list[tuple], since_ms: int) -> set[str]:
         if rec[TS] < since_ms or rec[RCOST] is not None or rec[MODEL] in missing:
             continue
         bare = rec[MODEL].strip().lower().split("[", 1)[0].rsplit("/", 1)[-1]
-        if bare and bare not in UNPRICEABLE and lookup_rate(table, rec[MODEL]) is None:
+        if bare and bare not in UNPRICEABLE and lookup_rate(table, rec[MODEL], rec[PROV]) is None:
             missing.add(rec[MODEL])
     return missing
 
@@ -399,7 +865,7 @@ def retry_due() -> bool:
 
 def price(table: dict, rec: tuple) -> tuple[float, float, bool]:
     """Returns (cost, cache_savings, unpriced)."""
-    rate = lookup_rate(table, rec[MODEL])
+    rate = lookup_rate(table, rec[MODEL], rec[PROV])
     savings = rec[CACHED] * (rate[0] - rate[2]) if rate else 0.0
     if rec[RCOST] is not None:
         return float(rec[RCOST]), savings, False
@@ -489,11 +955,12 @@ def aggregate(records: list[tuple], rates: dict, since_ms: int, until_ms: int, b
 # ------------------------------------------------------------------ rendering
 
 ANSI = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
-COLOR_INDEX = {"claude": 173, "codex": 245}
+PROVIDERS = ("claude", "codex", "antigravity")
+COLOR_INDEX = {"claude": 173, "codex": 245, "antigravity": 75}
 COLORS = {p: f"38;5;{n}" for p, n in COLOR_INDEX.items()}
 WARN = "38;5;196"  # pure red: spend the totals are missing
-ICON = {"claude": "✳", "codex": "⬡"}
-LABEL = {"claude": "Claude Code", "codex": "Codex"}
+ICON = {"claude": "✳", "codex": "⬡", "antigravity": "✦"}
+LABEL = {"claude": "Claude Code", "codex": "Codex", "antigravity": "Antigravity"}
 
 
 def c(code: str, s: str) -> str:
@@ -514,7 +981,7 @@ def fmt_usd(v: float) -> str:
 
 def chart_axis(series: dict[str, list[float]], height: int) -> tuple[list[str], dict[int, str]]:
     """Stacking order (Codex under Claude, as on the T3 page) and the y-axis labels by row from the bottom."""
-    order = [p for p in ("codex", "claude") if p in series]
+    order = [p for p in ("codex", "claude", "antigravity") if p in series]
     n = len(next(iter(series.values()))) if series else 0
     peak = max((sum(series[p][i] for p in order) for i in range(n)), default=0.0)
     return order, {height - 1: fmt_usd(peak), height // 2: fmt_usd(peak * (height // 2 + 1) / height), 0: "0"}
@@ -661,7 +1128,7 @@ def render(args: argparse.Namespace) -> None:
     out.append(line(bold("Today so far"), "", fmt(so_far)))
     out.append("")
     out.append(line(dim("Provider"), dim("Last 60 min"), dim("Today")))
-    for p in ("claude", "codex"):
+    for p in PROVIDERS:
         b = by_provider.get(p)
         if b is None:
             continue
@@ -679,7 +1146,7 @@ def render(args: argparse.Namespace) -> None:
     out.append("")
 
     out.append(bold("Per-minute cost"))
-    series = {p: [metric(by_minute.get(k, {}).get(p, Bucket())) for k in keys] for p in ("claude", "codex") if p in by_provider}
+    series = {p: [metric(by_minute.get(k, {}).get(p, Bucket())) for k in keys] for p in PROVIDERS if p in by_provider}
     chart_doc = None
     if not (series and any(v for s in series.values() for v in s)):
         out.append(dim("  no usage in the last hour"))

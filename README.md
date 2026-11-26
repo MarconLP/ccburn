@@ -1,6 +1,6 @@
 # ccburn
 
-A live burn-rate screen for Claude Code and Codex spend, in the terminal or in the macOS menu bar.
+A live burn-rate screen for Claude Code, Codex and Antigravity (Gemini) spend, in the terminal or in the macOS menu bar.
 
 <p align="center">
   <picture>
@@ -11,8 +11,9 @@ A live burn-rate screen for Claude Code and Codex spend, in the terminal or in t
   <sub>The menu bar panel. The figures are made up.</sub>
 </p>
 
-ccburn reads the transcripts the Claude Code and Codex CLIs already write to disk, prices every
-message against [LiteLLM's rate table](https://github.com/BerriAI/litellm), and draws one screen:
+ccburn reads the transcripts the Claude Code and Codex CLIs already write to disk, and the
+conversation databases of Antigravity, Google's agent for the Gemini models. It prices every
+message against [LiteLLM's rate table](https://github.com/BerriAI/litellm) and draws one screen:
 
 - **Pace**: spend rate over the last 5, 15 and 60 minutes and today's average, each with where today ends
   if that pace holds until midnight
@@ -20,7 +21,7 @@ message against [LiteLLM's rate table](https://github.com/BerriAI/litellm), and 
 - **Provider** and **Model** tables: last 60 minutes and today
 - **Per-minute cost**: a stacked chart of the last hour
 
-Costs are API-equivalent estimates. They are not what a Claude or ChatGPT subscription bills.
+Costs are API-equivalent estimates. They are not what a Claude, ChatGPT or Google AI subscription bills.
 
 ## Terminal
 
@@ -69,9 +70,16 @@ config directories, for example one per account, list them in `~/.config/ccburn/
 ```json
 {
   "claude_config_dirs": ["~/.claude-work"],
-  "codex_homes": []
+  "codex_homes": [],
+  "antigravity_data_dirs": []
 }
 ```
+
+For Antigravity it scans `~/.gemini/antigravity`, `~/.gemini/antigravity-cli`,
+`~/.gemini/antigravity-ide`, `~/.gemini/antigravity-backup`, `~/.config/antigravity`, every
+directory in `ANTIGRAVITY_DATA_DIR` (comma-separated) and the Antigravity profiles
+[T3 Code](https://github.com/pingdotgg/t3code) keeps under `~/.t3`. That covers the Gemini models
+and any other model run through Antigravity. Gemini CLI sessions (`~/.gemini/tmp`) are not read.
 
 The menu bar app has no shell environment, so set up extra profiles here rather than through
 environment variables. `CCBURN_CONFIG` points at a different config file.
