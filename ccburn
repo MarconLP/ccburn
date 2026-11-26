@@ -664,6 +664,10 @@ def transcript_roots(config: dict) -> list[tuple[str, Path]]:
         add("claude", h / ".claude" / "projects")
     for h in codex_homes:
         add("codex", h / "sessions")
+        # Codex moves a session's file here when the session is archived, which T3 Code does
+        # to a finished subagent within minutes. Long-archived files are compressed (.jsonl.zst)
+        # and not read; those are older than any day on screen.
+        add("codex", h / "archived_sessions")
     return roots
 
 
@@ -690,11 +694,18 @@ def collect_records(since_ms: int, verbose: bool, config: dict) -> tuple[list[tu
     records: list[tuple] = []
     stats = {"files": 0, "parsed": 0}
     cutoff = (since_ms - MTIME_SLACK_MS) / 1000
+    codex_names: set[str] = set()
     for provider, root in transcript_roots(config):
         for dirpath, _dirs, files in os.walk(root):
             for name in files:
                 if not name.endswith(".jsonl"):
                     continue
+                if provider == "codex":
+                    # A session is named after its ID: a file found under both sessions/ and
+                    # archived_sessions/ is one session, counted once.
+                    if name in codex_names:
+                        continue
+                    codex_names.add(name)
                 p = Path(dirpath) / name
                 try:
                     stt = p.stat()
